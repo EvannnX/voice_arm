@@ -1,0 +1,27 @@
+# =============================================================
+# ACT Training Config for SO-101 Cup Handover (Fallback)
+# =============================================================
+# Usage (Colab T4):
+#   python -m lerobot.scripts.train --config configs/act_train.yaml
+#
+# ACT is ~80M params, trains in 2-4 hours on T4.
+# Runs at 5-15 Hz on CPU - the most reliable option.
+# =============================================================
+
+# ---- Model ----
+policy:
+  type: act
+
+# ---- Dataset ----
+dataset:
+  repo_id: YOUR_HF_USER/so101_cup_handover  # <-- Change this!
+
+# ---- Training ----
+batch_size: 8
+steps: 100000           # ~2-4 hours on T4
+save_freq: 10000
+output_dir: /content/drive/MyDrive/act_cup
+
+# ---- Logging ----
+wandb:
+  enable: false

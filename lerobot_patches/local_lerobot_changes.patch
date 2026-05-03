@@ -1,0 +1,185 @@
+diff --git a/src/lerobot/cameras/opencv/camera_opencv.py b/src/lerobot/cameras/opencv/camera_opencv.py
+index f3289dd..71590e7 100644
+--- a/src/lerobot/cameras/opencv/camera_opencv.py
++++ b/src/lerobot/cameras/opencv/camera_opencv.py
+@@ -233,9 +233,14 @@ class OpenCVCamera(Camera):
+ 
+         success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
+         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
+-        # Use math.isclose for robust float comparison
+-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
++        # Some V4L2 drivers report `set(...)=False` even when the requested value is applied.
++        # Treat the requested FPS as valid as long as `get()` matches.
++        if not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
+             raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
++        if not success:
++            logger.warning(
++                f"{self} reported set(CAP_PROP_FPS)=False, but requested FPS appears applied ({actual_fps=})."
++            )
+ 
+     def _validate_fourcc(self) -> None:
+         """Validates and sets the camera's FOURCC code."""
+@@ -271,16 +276,26 @@ class OpenCVCamera(Camera):
+         height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
+ 
+         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+-        if not width_success or self.capture_width != actual_width:
++        # Some camera drivers return `set(...)=False` while the requested geometry is already active.
++        # Keep strict value check, but don't fail solely on the boolean flag.
++        if self.capture_width != actual_width:
+             raise RuntimeError(
+                 f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
+             )
++        if not width_success:
++            logger.warning(
++                f"{self} reported set(CAP_PROP_FRAME_WIDTH)=False, but requested width appears applied ({actual_width=})."
++            )
+ 
+         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+-        if not height_success or self.capture_height != actual_height:
++        if self.capture_height != actual_height:
+             raise RuntimeError(
+                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+             )
++        if not height_success:
++            logger.warning(
++                f"{self} reported set(CAP_PROP_FRAME_HEIGHT)=False, but requested height appears applied ({actual_height=})."
++            )
+ 
+     @staticmethod
+     def find_cameras() -> list[dict[str, Any]]:
+diff --git a/src/lerobot/motors/motors_bus.py b/src/lerobot/motors/motors_bus.py
+index 509f5e9..2680003 100644
+--- a/src/lerobot/motors/motors_bus.py
++++ b/src/lerobot/motors/motors_bus.py
+@@ -454,7 +454,7 @@ class SerialMotorsBus(MotorsBusBase):
+ 
+         found_models = {}
+         for id_ in self.ids:
+-            model_nb = self.ping(id_)
++            model_nb = self.ping(id_, num_retry=10)
+             if model_nb is not None:
+                 found_models[id_] = model_nb
+ 
+@@ -941,12 +941,15 @@ class SerialMotorsBus(MotorsBusBase):
+         Returns:
+             int | None: Motor model number or `None` on failure.
+         """
++        import time as _time
++
+         id_ = self._get_motor_id(motor)
+         for n_try in range(1 + num_retry):
+             model_number, comm, error = self.packet_handler.ping(self.port_handler, id_)
+             if self._is_comm_success(comm):
+                 break
+             logger.debug(f"ping failed for {id_=}: {n_try=} got {comm=} {error=}")
++            _time.sleep(0.05)
+ 
+         if not self._is_comm_success(comm):
+             if raise_on_error:
+diff --git a/src/lerobot/robots/so_follower/so_follower.py b/src/lerobot/robots/so_follower/so_follower.py
+index ca132d1..c026520 100644
+--- a/src/lerobot/robots/so_follower/so_follower.py
++++ b/src/lerobot/robots/so_follower/so_follower.py
+@@ -102,6 +102,7 @@ class SOFollower(Robot):
+             cam.connect()
+ 
+         self.configure()
++        self.bus.enable_torque()
+         logger.info(f"{self} connected.")
+ 
+     @property
+diff --git a/src/lerobot/scripts/lerobot_record.py b/src/lerobot/scripts/lerobot_record.py
+index ac01c93..9d2fcf0 100644
+--- a/src/lerobot/scripts/lerobot_record.py
++++ b/src/lerobot/scripts/lerobot_record.py
+@@ -67,6 +67,7 @@ lerobot-record \
+ ```
+ """
+ 
++import json
+ import logging
+ import time
+ from dataclasses import asdict, dataclass, field
+@@ -200,6 +201,9 @@ class DatasetRecordConfig:
+     encoder_threads: int | None = None
+     # Rename map for the observation to override the image and state keys
+     rename_map: dict[str, str] = field(default_factory=dict)
++    # Optional path to an existing stats.json used to override policy normalization
++    # during policy-driven runs (useful for real-robot eval with custom datasets).
++    stats_path: str | None = None
+ 
+     def __post_init__(self):
+         if self.single_task is None:
+@@ -503,19 +507,50 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+             )
+ 
+         # Load pretrained policy
+-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
++        # Pass rename_map during policy creation so feature-name validation
++        # compares dataset keys in the policy namespace (camera1/2/3 etc.).
++        policy = None if cfg.policy is None else make_policy(
++            cfg.policy,
++            ds_meta=dataset.meta,
++            rename_map=cfg.dataset.rename_map,
++        )
+         preprocessor = None
+         postprocessor = None
+         if cfg.policy is not None:
++            processor_stats = rename_stats(dataset.meta.stats, cfg.dataset.rename_map)
++            if cfg.dataset.stats_path:
++                stats_path = Path(cfg.dataset.stats_path).expanduser().resolve()
++                if not stats_path.exists():
++                    raise FileNotFoundError(f"dataset.stats_path does not exist: {stats_path}")
++                with stats_path.open("r", encoding="utf-8") as f:
++                    processor_stats = rename_stats(json.load(f), cfg.dataset.rename_map)
++
++            preprocessor_overrides = {
++                "device_processor": {"device": cfg.policy.device},
++                "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
++            }
++            postprocessor_overrides = {}
++            if processor_stats:
++                preprocessor_overrides["normalizer_processor"] = {"stats": processor_stats}
++                postprocessor_overrides["unnormalizer_processor"] = {"stats": processor_stats}
++
+             preprocessor, postprocessor = make_pre_post_processors(
+                 policy_cfg=cfg.policy,
+                 pretrained_path=cfg.policy.pretrained_path,
+-                dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+-                preprocessor_overrides={
+-                    "device_processor": {"device": cfg.policy.device},
+-                    "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
+-                },
++                dataset_stats=processor_stats,
++                preprocessor_overrides=preprocessor_overrides,
++                postprocessor_overrides=postprocessor_overrides,
+             )
++            # Quick visibility for real-robot debugging: verify action unnormalizer stats source.
++            for step in postprocessor.steps:
++                if step.__class__.__name__ == "UnnormalizerProcessorStep":
++                    action_stats = getattr(step, "stats", {}).get("action", {})
++                    logging.info(
++                        "Postprocessor action stats loaded: mean=%s std=%s",
++                        action_stats.get("mean"),
++                        action_stats.get("std"),
++                    )
++                    break
+ 
+         robot.connect()
+         if teleop is not None:
+diff --git a/src/lerobot/teleoperators/so_leader/so_leader.py b/src/lerobot/teleoperators/so_leader/so_leader.py
+index 04ce0f2..1308561 100644
+--- a/src/lerobot/teleoperators/so_leader/so_leader.py
++++ b/src/lerobot/teleoperators/so_leader/so_leader.py
+@@ -146,8 +146,8 @@ class SOLeader(Teleoperator):
+         return action
+ 
+     def send_feedback(self, feedback: dict[str, float]) -> None:
+-        # TODO: Implement force feedback
+-        raise NotImplementedError
++        # SO-100/101 leader arms have no force feedback hardware; feedback_features returns {}
++        pass
+ 
+     @check_if_not_connected
+     def disconnect(self) -> None:

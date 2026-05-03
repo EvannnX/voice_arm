@@ -29,6 +29,28 @@ htmlcov/
 secrets/
 credentials/
 
+# Robot datasets / model artifacts
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tar.gz
+*.zip
+pretrained_model/
+pretrained_model_ready/
+outputs/
+eval_data/
+datasets/
+videos/
+*.mp4
+*.avi
+*.mkv
+*.rrd
+
+# Local speech model binaries
+voice_control/models/vosk-model-small-en-us-0.15/
+
 # IDE
 .vscode/
 .idea/
